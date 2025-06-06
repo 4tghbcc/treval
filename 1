@@ -1,0 +1,164 @@
+### `server/config.js`
+```js
+module.exports = {
+    jwtSecret: "YOUR_SECRET_KEY",
+    mongoUri: "mongodb://localhost:27017/travel-diary"
+}
+```
+
+---
+
+### `server/models/user.js`
+```js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+});
+
+// Хеширование пароля перед сохранением
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 10);
+  next();
+});
+
+userSchema.methods.comparePassword = function(password) {
+    return bcrypt.compare(password, this.password);
+};
+
+module.exports = mongoose.model('User', userSchema);
+```
+
+---
+
+### `server/models/trip.js`
+```js
+const mongoose = require('mongoose');
+
+const tripSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: { type: String, required: true },
+  description: String,
+  location: {
+    type: { type: String, default: 'Point' },
+    coordinates: [Number], // [lng, lat]
+  },
+  photoUrl: String,
+  price: Number,
+}, { timestamps: true });
+
+tripSchema.index({ location: "2dsphere" });
+
+module.exports = mongoose.model('Trip', tripSchema);
+```
+
+---
+
+### `server/routes/auth.js`
+```js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const User = require('../models/user');
+const { jwtSecret } = require('../config');
+
+const router = express.Router();
+
+// Регистрация
+router.post('/register', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    if (await User.findOne({ username })) {
+      return res.status(409).json({ msg: 'User exists' });
+    }
+    const user = await User.create({ username, password });
+    const token = jwt.sign({ userId: user._id }, jwtSecret);
+    res.json({ token, username: user.username });
+  } catch (err) {
+    res.status(400).json({ msg: err.message });
+  }
+});
+
+// Логин
+router.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const user = await User.findOne({ username });
+    if (!user || !(await user.comparePassword(password)))
+      return res.status(401).json({ msg: 'Invalid credentials' });
+    const token = jwt.sign({ userId: user._id }, jwtSecret);
+    res.json({ token, username: user.username });
+  } catch (err) {
+    res.status(400).json({ msg: err.message });
+  }
+});
+
+module.exports = router;
+```
+
+---
+
+### `server/routes/trips.js`
+```js
+const express = require('express');
+const Trip = require('../models/trip');
+const jwt = require('jsonwebtoken');
+const { jwtSecret } = require('../config');
+const multer = require('multer');
+const path = require('path');
+
+const upload = multer({ dest: 'uploads/' });
+
+const router = express.Router();
+
+// Middleware проверки JWT
+function auth(req, res, next) {
+  const token = req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.sendStatus(401);
+  try {
+    req.user = jwt.verify(token, jwtSecret);
+    next();
+  } catch {
+    res.sendStatus(401);
+  }
+}
+
+// Создать поездку
+router.post('/', auth, upload.single('photo'), async (req, res) => {
+  try {
+    const { title, description, price, lat, lng } = req.body;
+    let photoUrl = '';
+    if (req.file) {
+      photoUrl = `/uploads/${req.file.filename}`;
+}
+    const trip = await Trip.create({
+      user: req.user.userId,
+      title,
+      description,
+      location: {
+        type: 'Point',
+        coordinates: [Number(lng), Number(lat)],
+      },
+      price,
+      photoUrl
+    });
+    res.json(trip);
+  } catch (e) {
+    res.status(400).json({ msg: e.message });
+  }
+});
+
+// Получить все поездки
+router.get('/', async (req, res) => {
+  const { minPrice, maxPrice } = req.query;
+  let filter = {};
+  if (minPrice && maxPrice) {
+    filter.price = { $gte: Number(minPrice), $lte: Number(maxPrice) }
+  }
+  const trips = await Trip.find(filter).populate('user', 'username').sort('-createdAt');
+  res.json(trips);
+});
+
+module.exports = router;
